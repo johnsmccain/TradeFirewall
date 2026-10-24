@@ -1,0 +1,799 @@
+// SoDEX public REST — https://testnet-gw.sodex.dev/api/v1/spot (default)
+// Responses use `code` + `data`; tickers/orderbooks use exchange-native field names.
+
+export interface SodexSymbol {
+  symbol: string;
+  baseAsset: string;
+  quoteAsset: string;
+  status: string;
+  baseAssetPrecision: number;
+  quotePrecision: number;
+  orderTypes: string[];
+  filters: unknown[];
+  permissions: string[];
+  /** Present on SoDEX market rows */
+  name?: string;
+  makerFee?: string;
+  takerFee?: string;
+  /** Numeric symbolID required for signed order placement (GET /markets/symbols) */
+  id?: number;
+  tickSize?: string;
+  stepSize?: string;
+  pricePrecision?: number;
+  quantityPrecision?: number;
+  minNotional?: string;
+}
+
+export interface SodexAccountState {
+  address: string;
+  accountID: number;
+  userID: number;
+  balances: Array<{ coinID: number; coin: string; total: string; locked: string }>;
+}
+
+export interface SodexCoin {
+  coin: string;
+  name: string;
+  networkList: unknown[];
+}
+
+export interface SodexTicker {
+  symbol: string;
+  priceChange: string;
+  priceChangePercent: string;
+  weightedAvgPrice: string;
+  prevClosePrice: string;
+  lastPrice: string;
+  lastQty: string;
+  bidPrice: string;
+  bidQty: string;
+  askPrice: string;
+  askQty: string;
+  openPrice: string;
+  highPrice: string;
+  lowPrice: string;
+  volume: string;
+  quoteVolume: string;
+  openTime: number;
+  closeTime: number;
+  firstId: number;
+  lastId: number;
+  count: number;
+}
+
+export interface SodexMiniTicker {
+  symbol: string;
+  openPrice: string;
+  highPrice: string;
+  lowPrice: string;
+  lastPrice: string;
+  volume: string;
+  quoteVolume: string;
+  openTime: number;
+  closeTime: number;
+  firstId: number;
+  lastId: number;
+  count: number;
+}
+
+export interface SodexBookTicker {
+  symbol: string;
+  bidPrice: string;
+  bidQty: string;
+  askPrice: string;
+  askQty: string;
+}
+
+export interface SodexOrderbookEntry {
+  price: string;
+  quantity: string;
+}
+
+export interface SodexOrderbook {
+  lastUpdateId: number;
+  bids: SodexOrderbookEntry[];
+  asks: SodexOrderbookEntry[];
+}
+
+export interface SodexKline {
+  openTime: number;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
+  closeTime: number;
+  quoteAssetVolume: string;
+  numberOfTrades: number;
+  takerBuyBaseAssetVolume: string;
+  takerBuyQuoteAssetVolume: string;
+}
+
+export interface SodexTrade {
+  id: number;
+  price: string;
+  qty: string;
+  quoteQty: string;
+  time: number;
+  isBuyerMaker: boolean;
+}
+
+export interface SodexMarkPrice {
+  symbol: string;
+  markPrice: string;
+  indexPrice: string;
+  estimatedSettlePrice: string;
+  lastFundingRate: string;
+  nextFundingTime: number;
+  interestRate: string;
+  time: number;
+}
+
+export interface SodexExecutionPreview {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  amount: number;
+  estimatedPrice: number;
+  estimatedSlippage: number;
+  estimatedFees: number;
+  priceImpact: number;
+  executionProbability: number;
+  warnings: string[];
+  canExecute: boolean;
+  mode: 'preview';
+  liquidityAnalysis: {
+    totalBidLiquidity: number;
+    totalAskLiquidity: number;
+    spreadPercent: number;
+    marketDepth: number;
+  };
+}
+
+export interface SodexFetchMeta {
+  endpoints: string[];
+  network: 'testnet' | 'mainnet';
+  fetchedAtMs: number;
+}
+
+export interface SodexMarketMicrostructure {
+  ticker: SodexTicker;
+  orderbook: SodexOrderbook;
+  klines: SodexKline[];
+  recentTrades: SodexTrade[];
+  executionPreview: SodexExecutionPreview;
+  liquidityAnalysis: SodexExecutionPreview['liquidityAnalysis'] & {
+    bidLevels: number;
+    askLevels: number;
+  };
+  meta: SodexFetchMeta;
+}
+
+class SoDEXAPI {
+  private readonly spotBaseUrl: string;
+  private readonly network: 'testnet' | 'mainnet';
+  private symbolsCache: { at: number; rows: Record<string, unknown>[] } | null = null;
+  private static readonly SYMBOLS_TTL_MS = 5 * 60 * 1000;
+
+  get configuredNetwork(): 'testnet' | 'mainnet' {
+    return this.network;
+  }
+
+  constructor() {
+    const useTestnet = (process.env.SODEX_USE_TESTNET ?? 'true').toLowerCase() !== 'false';
+    this.network = useTestnet ? 'testnet' : 'mainnet';
+    this.spotBaseUrl = (
+      useTestnet
+        ? process.env.SODEX_TESTNET_SPOT_URL || 'https://testnet-gw.sodex.dev/api/v1/spot'
+        : process.env.SODEX_MAINNET_SPOT_URL || 'https://mainnet-gw.sodex.dev/api/v1/spot'
+    ).replace(/\/$/, '');
+  }
+
+  private unwrap(payload: unknown): unknown {
+    if (
+      payload &&
+      typeof payload === 'object' &&
+      'code' in payload &&
+      typeof (payload as { code: unknown }).code === 'number'
+    ) {
+      const p = payload as { code: number; message?: string; data?: unknown };
+      if (p.code !== 0) {
+        throw new Error(`SoDEX error ${p.code}: ${p.message || 'request failed'}`);
+      }
+      return p.data;
+    }
+    return payload;
+  }
+
+  /** Read-only mainnet base URL, independent of SODEX_USE_TESTNET — used only for historical
+   * backtest data (real prices), never for order placement (execution stays testnet-only). */
+  static readonly MAINNET_SPOT_URL = (
+    process.env.SODEX_MAINNET_SPOT_URL || 'https://mainnet-gw.sodex.dev/api/v1/spot'
+  ).replace(/\/$/, '');
+
+  private async fetchSpot(path: string, baseUrlOverride?: string): Promise<unknown> {
+    const base = baseUrlOverride ?? this.spotBaseUrl;
+    const url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetch(url, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'TradeFirewall/1.1',
+        },
+        signal: controller.signal,
+        next: { revalidate: 0 },
+      });
+      if (!response.ok) {
+        throw new Error(`SoDEX HTTP ${response.status}: ${response.statusText}`);
+      }
+      return this.unwrap(await response.json());
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private mapSymbolToSodexFormat(symbol: string): string {
+    const symbolMap: Record<string, string> = {
+      BTC: 'vBTC_vUSDC',
+      ETH: 'vETH_vUSDC',
+      SOL: 'vSOL_vUSDC',
+      ADA: 'vADA_vUSDC',
+      AVAX: 'vAVAX_vUSDC',
+      DOGE: 'vDOGE_vUSDC',
+      XRP: 'vXRP_vUSDC',
+      BNB: 'vBNB_vUSDC',
+      LINK: 'vLINK_vUSDC',
+      UNI: 'vUNI_vUSDC',
+      AAVE: 'vAAVE_vUSDC',
+      LTC: 'vLTC_vUSDC',
+      SHIB: 'vSHIB_vUSDC',
+      ZEC: 'vZEC_vUSDC',
+      USDT: 'vUSDT_vUSDC',
+      SOSO: 'WSOSO_vUSDC',
+      HYPE: 'vHYPE_vUSDC',
+      AAPL: 'vAAPL_vUSDC',
+      TSLA: 'vTSLA_vUSDC',
+      NVDA: 'vNVDA_vUSDC',
+      MSFT: 'vMSFT_vUSDC',
+      GOOGL: 'vGOOGL_vUSDC',
+      AMZN: 'vAMZN_vUSDC',
+      META: 'vMETA_vUSDC',
+      TESTBTC: 'TESTBTC_vUSDC',
+      TESTSOSO: 'TESTSOSO_vUSDC',
+      TESTSHIB: 'TESTSHIB_vUSDC',
+    };
+    const u = symbol.toUpperCase();
+    return symbolMap[u] || symbol;
+  }
+
+  private normalizeTickerRow(raw: Record<string, unknown>, sodexSymbol: string): SodexTicker {
+    const lastPx = String(raw.lastPx ?? raw.lastPrice ?? '0');
+    const openPx = String(raw.openPx ?? raw.openPrice ?? '0');
+    const vol = String(raw.volume ?? '0');
+    const qVol = String(raw.quoteVolume ?? '0');
+    const bidPx = String(raw.bidPx ?? raw.bidPrice ?? '0');
+    const bidSz = String(raw.bidSz ?? raw.bidQty ?? '0');
+    const askPx = String(raw.askPx ?? raw.askPrice ?? '0');
+    const askSz = String(raw.askSz ?? raw.askQty ?? '0');
+    return {
+      symbol: String(raw.symbol ?? sodexSymbol),
+      priceChange: String(raw.change ?? raw.priceChange ?? '0'),
+      priceChangePercent: String(raw.changePct ?? raw.priceChangePercent ?? '0'),
+      weightedAvgPrice: lastPx,
+      prevClosePrice: openPx,
+      lastPrice: lastPx,
+      lastQty: '0',
+      bidPrice: bidPx,
+      bidQty: bidSz,
+      askPrice: askPx,
+      askQty: askSz,
+      openPrice: openPx,
+      highPrice: String(raw.highPx ?? raw.highPrice ?? lastPx),
+      lowPrice: String(raw.lowPx ?? raw.lowPrice ?? lastPx),
+      volume: vol,
+      quoteVolume: qVol,
+      openTime: Number(raw.openTime ?? 0),
+      closeTime: Number(raw.closeTime ?? 0),
+      firstId: 0,
+      lastId: 0,
+      count: Number(raw.count ?? 0),
+    };
+  }
+
+  private normalizeOrderbook(data: Record<string, unknown>): SodexOrderbook {
+    const bidsRaw = (data.bids as unknown[]) || [];
+    const asksRaw = (data.asks as unknown[]) || [];
+    const toRow = (row: unknown): SodexOrderbookEntry => {
+      if (Array.isArray(row) && row.length >= 2) {
+        return { price: String(row[0]), quantity: String(row[1]) };
+      }
+      if (row && typeof row === 'object') {
+        const o = row as { price?: string; quantity?: string; qty?: string };
+        return { price: String(o.price ?? '0'), quantity: String(o.quantity ?? o.qty ?? '0') };
+      }
+      return { price: '0', quantity: '0' };
+    };
+    return {
+      lastUpdateId: Number(data.updateID ?? data.lastUpdateId ?? 0),
+      bids: bidsRaw.map(toRow),
+      asks: asksRaw.map(toRow),
+    };
+  }
+
+  private normalizeKline(row: Record<string, unknown>): SodexKline {
+    const t = Number(row.t ?? row.openTime ?? 0);
+    const cT = Number(row.T ?? row.closeTime ?? t);
+    return {
+      openTime: t,
+      open: String(row.o ?? row.open ?? '0'),
+      high: String(row.h ?? row.high ?? '0'),
+      low: String(row.l ?? row.low ?? '0'),
+      close: String(row.c ?? row.close ?? '0'),
+      volume: String(row.v ?? row.volume ?? '0'),
+      closeTime: cT,
+      quoteAssetVolume: String(row.q ?? row.quoteAssetVolume ?? '0'),
+      numberOfTrades: Number(row.n ?? row.numberOfTrades ?? 0),
+      takerBuyBaseAssetVolume: '0',
+      takerBuyQuoteAssetVolume: '0',
+    };
+  }
+
+  private normalizeTrade(row: Record<string, unknown>, idx: number): SodexTrade {
+    const side = String(row.S ?? '');
+    return {
+      id: Number(row.t ?? row.id ?? idx),
+      price: String(row.p ?? row.price ?? '0'),
+      qty: String(row.q ?? row.qty ?? '0'),
+      quoteQty: '0',
+      time: Number(row.T ?? row.time ?? 0),
+      isBuyerMaker: side.toUpperCase() === 'SELL',
+    };
+  }
+
+  async getSpotSymbols(): Promise<SodexSymbol[]> {
+    const rows = (await this.fetchSpot('/markets/symbols')) as Record<string, unknown>[];
+    if (!Array.isArray(rows)) throw new Error('SoDEX /markets/symbols: unexpected shape');
+    this.symbolsCache = { at: Date.now(), rows };
+    return rows as unknown as SodexSymbol[];
+  }
+
+  private async getSymbolsRowsCached(): Promise<Record<string, unknown>[]> {
+    if (this.symbolsCache && Date.now() - this.symbolsCache.at < SoDEXAPI.SYMBOLS_TTL_MS) {
+      return this.symbolsCache.rows;
+    }
+    await this.getSpotSymbols();
+    return this.symbolsCache!.rows;
+  }
+
+  async getSpotTickers(): Promise<SodexTicker[]> {
+    const rows = (await this.fetchSpot('/markets/tickers')) as Record<string, unknown>[];
+    if (!Array.isArray(rows)) throw new Error('SoDEX /markets/tickers: unexpected shape');
+    return rows.map((r) => this.normalizeTickerRow(r, String(r.symbol ?? '')));
+  }
+
+  async getSpotTicker(symbol: string): Promise<SodexTicker> {
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    const tickers = await this.getSpotTickers();
+    const hit = tickers.find((t) => t.symbol === sodexSymbol);
+    if (!hit) {
+      throw new Error(`Ticker for ${symbol} (${sodexSymbol}) not found on SoDEX`);
+    }
+    return hit;
+  }
+
+  async getSpotBookTickers(): Promise<SodexBookTicker[]> {
+    const rows = (await this.fetchSpot('/markets/bookTickers')) as Record<string, unknown>[];
+    if (!Array.isArray(rows)) throw new Error('SoDEX /markets/bookTickers: unexpected shape');
+    return rows.map((r) => ({
+      symbol: String(r.symbol ?? ''),
+      bidPrice: String(r.bidPx ?? r.bidPrice ?? '0'),
+      bidQty: String(r.bidSz ?? r.bidQty ?? '0'),
+      askPrice: String(r.askPx ?? r.askPrice ?? '0'),
+      askQty: String(r.askSz ?? r.askQty ?? '0'),
+    }));
+  }
+
+  async getSpotBookTicker(symbol: string): Promise<SodexBookTicker> {
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    const all = await this.getSpotBookTickers();
+    const hit = all.find((b) => b.symbol === sodexSymbol);
+    if (!hit) throw new Error(`Book ticker for ${symbol} (${sodexSymbol}) not found on SoDEX`);
+    return hit;
+  }
+
+  async getSpotOrderbook(symbol: string, limit = 100): Promise<SodexOrderbook> {
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    const raw = (await this.fetchSpot(
+      `/markets/${encodeURIComponent(sodexSymbol)}/orderbook?limit=${limit}`
+    )) as Record<string, unknown>;
+    return this.normalizeOrderbook(raw);
+  }
+
+  async getSpotKlines(symbol: string, interval: string, limit = 100): Promise<SodexKline[]> {
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    const rows = (await this.fetchSpot(
+      `/markets/${encodeURIComponent(sodexSymbol)}/klines?interval=${encodeURIComponent(
+        interval
+      )}&limit=${limit}`
+    )) as Record<string, unknown>[];
+    if (!Array.isArray(rows)) throw new Error('SoDEX klines: unexpected shape');
+    return rows.map((r) => this.normalizeKline(r));
+  }
+
+  /**
+   * Real historical klines, always read from SoDEX **mainnet** regardless of SODEX_USE_TESTNET.
+   * Used only by src/lib/backtest.ts for genuine price history — never for execution.
+   */
+  async getSpotKlinesFromMainnet(
+    symbol: string,
+    interval: string,
+    limit = 100,
+    startTime?: number,
+    endTime?: number
+  ): Promise<SodexKline[]> {
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    let path = `/markets/${encodeURIComponent(sodexSymbol)}/klines?interval=${encodeURIComponent(
+      interval
+    )}&limit=${limit}`;
+    if (startTime !== undefined) path += `&startTime=${startTime}`;
+    if (endTime !== undefined) path += `&endTime=${endTime}`;
+    const rows = (await this.fetchSpot(path, SoDEXAPI.MAINNET_SPOT_URL)) as Record<string, unknown>[];
+    if (!Array.isArray(rows)) throw new Error('SoDEX mainnet klines: unexpected shape');
+    return rows.map((r) => this.normalizeKline(r));
+  }
+
+  /** Numeric symbolID required for signed order placement (distinct from the string market name). */
+  async getSpotSymbolID(symbol: string): Promise<number> {
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    const rows = await this.getSymbolsRowsCached();
+    const row = rows.find((s) => String(s.name ?? '') === sodexSymbol);
+    const id = row ? Number(row.id) : NaN;
+    if (!Number.isFinite(id)) throw new Error(`SoDEX symbolID not found for ${symbol} (${sodexSymbol})`);
+    return id;
+  }
+
+  /** Symbol trading rules (tick/step size, precision) needed to format signed order price/quantity. */
+  async getSpotSymbolRules(symbol: string): Promise<{
+    symbolID: number;
+    tickSize: number;
+    stepSize: number;
+    pricePrecision: number;
+    quantityPrecision: number;
+    minNotional: number;
+  }> {
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    const rows = await this.getSymbolsRowsCached();
+    const row = rows.find((s) => String(s.name ?? '') === sodexSymbol);
+    if (!row) throw new Error(`SoDEX symbol rules not found for ${symbol} (${sodexSymbol})`);
+    const id = Number(row.id);
+    if (!Number.isFinite(id)) throw new Error(`SoDEX symbolID not found for ${symbol} (${sodexSymbol})`);
+    return {
+      symbolID: id,
+      tickSize: parseFloat(String(row.tickSize ?? '0.01')),
+      stepSize: parseFloat(String(row.stepSize ?? '0.01')),
+      pricePrecision: Number(row.pricePrecision ?? 2),
+      quantityPrecision: Number(row.quantityPrecision ?? 2),
+      minNotional: parseFloat(String(row.minNotional ?? '0')),
+    };
+  }
+
+  /**
+   * Resolves a wallet address to its SoDEX accountID. Public, no auth required.
+   * Always reads from this instance's configured network (testnet by default —
+   * matches where order placement actually happens).
+   */
+  async getAccountState(address: string): Promise<SodexAccountState> {
+    const NOT_ONBOARDED_MESSAGE =
+      'This wallet has no SoDEX testnet account yet. Visit https://testnet.sodex.com, connect this wallet, and claim testnet funds from the faucet, then try again.';
+
+    let raw: { user?: string; aid?: number; uid?: number; B?: Array<{ i: number; a: string; t: string; l: string }> };
+    try {
+      raw = (await this.fetchSpot(`/accounts/${address}/state`)) as typeof raw;
+    } catch (err) {
+      // SoDEX returns code -1 "invalid parameter: userAddress" for addresses it has
+      // never seen at all (never onboarded), which unwrap() turns into a thrown Error.
+      throw new Error(NOT_ONBOARDED_MESSAGE, { cause: err });
+    }
+    const accountID = Number(raw?.aid);
+    if (!Number.isFinite(accountID) || accountID <= 0) {
+      // SoDEX also returns code 0 with aid:0 for some addresses it has seen but that
+      // never completed account creation — Go's validator treats 0 as "missing" on
+      // submit, so catch it here with an actionable message instead of a cryptic
+      // "AccountID required" error at order time.
+      throw new Error(NOT_ONBOARDED_MESSAGE);
+    }
+    return {
+      address,
+      accountID,
+      userID: Number(raw?.uid ?? accountID),
+      balances: (raw?.B ?? []).map((b) => ({ coinID: b.i, coin: b.a, total: b.t, locked: b.l })),
+    };
+  }
+
+  async getSpotTrades(symbol: string, limit = 100): Promise<SodexTrade[]> {
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    const rows = (await this.fetchSpot(
+      `/markets/${encodeURIComponent(sodexSymbol)}/trades?limit=${limit}`
+    )) as Record<string, unknown>[];
+    if (!Array.isArray(rows)) throw new Error('SoDEX trades: unexpected shape');
+    return rows.map((r, i) => this.normalizeTrade(r, i));
+  }
+
+  async validateSymbolExists(symbol: string): Promise<boolean> {
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    const rows = await this.getSymbolsRowsCached();
+    return rows.some((s) => String(s.name ?? s.symbol ?? '') === sodexSymbol);
+  }
+
+  /**
+   * Top-of-book: bookTicker first, then orderbook top level, then last trade price (illiquid testnet).
+   */
+  private async resolveTopOfBookPrices(
+    symbol: string,
+    orderbook: SodexOrderbook,
+    bookTicker: SodexBookTicker
+  ): Promise<{ bidPrice: number; askPrice: number }> {
+    const bid0 = orderbook.bids[0];
+    const ask0 = orderbook.asks[0];
+    const bookBestBid = bid0 ? parseFloat(bid0.price) : NaN;
+    const bookBestAsk = ask0 ? parseFloat(ask0.price) : NaN;
+
+    let bid = parseFloat(bookTicker.bidPrice);
+    let ask = parseFloat(bookTicker.askPrice);
+
+    if (!Number.isFinite(bid) || bid <= 0) bid = bookBestBid;
+    if (!Number.isFinite(ask) || ask <= 0) ask = bookBestAsk;
+
+    if (!Number.isFinite(bid) || bid <= 0) {
+      bid = Number.isFinite(ask) && ask > 0 ? ask * 0.9995 : bookBestBid;
+    }
+    if (!Number.isFinite(ask) || ask <= 0) {
+      ask = Number.isFinite(bid) && bid > 0 ? bid * 1.0005 : bookBestAsk;
+    }
+
+    if (!Number.isFinite(bid) || bid <= 0 || !Number.isFinite(ask) || ask <= 0) {
+      const t = await this.getSpotTicker(symbol);
+      const last = parseFloat(t.lastPrice);
+      if (Number.isFinite(last) && last > 0) {
+        if (!Number.isFinite(bid) || bid <= 0) bid = last * 0.9995;
+        if (!Number.isFinite(ask) || ask <= 0) ask = last * 1.0005;
+      }
+    }
+
+    if (!Number.isFinite(bid) || bid <= 0 || !Number.isFinite(ask) || ask <= 0) {
+      throw new Error('SoDEX orderbook has no usable top-of-book bid/ask');
+    }
+    if (ask < bid) {
+      const tmp = bid;
+      bid = ask;
+      ask = tmp;
+    }
+    return { bidPrice: bid, askPrice: ask };
+  }
+
+  /**
+   * Public wrapper for order preparation (place-order route): resolves usable bid/ask
+   * with the same bookTicker → orderbook → last-trade fallback chain execution preview
+   * already relies on, instead of failing outright on SoDEX testnet's frequently
+   * one-sided/thin books (e.g. bids present, asks empty).
+   */
+  async getExecutionReferencePrices(symbol: string): Promise<{ bidPrice: number; askPrice: number }> {
+    const [orderbook, bookTicker] = await Promise.all([
+      this.getSpotOrderbook(symbol, 100),
+      this.getSpotBookTicker(symbol),
+    ]);
+    return this.resolveTopOfBookPrices(symbol, orderbook, bookTicker);
+  }
+
+  private async analyzeLiquidityFromData(
+    symbol: string,
+    orderbook: SodexOrderbook,
+    bookTicker: SodexBookTicker
+  ): Promise<{
+    totalBidLiquidity: number;
+    totalAskLiquidity: number;
+    spreadPercent: number;
+    marketDepth: number;
+    bidLevels: number;
+    askLevels: number;
+  }> {
+    const { bidPrice, askPrice } = await this.resolveTopOfBookPrices(symbol, orderbook, bookTicker);
+    const spread = askPrice - bidPrice;
+    const mid = (bidPrice + askPrice) / 2;
+    const spreadPercent = mid > 0 ? (spread / mid) * 100 : 0;
+    const threshold = mid * 0.02;
+    let totalBidLiquidity = 0;
+    let totalAskLiquidity = 0;
+    for (const bid of orderbook.bids) {
+      const p = parseFloat(bid.price);
+      const q = parseFloat(bid.quantity);
+      if (mid - p <= threshold) totalBidLiquidity += q * p;
+    }
+    for (const ask of orderbook.asks) {
+      const p = parseFloat(ask.price);
+      const q = parseFloat(ask.quantity);
+      if (p - mid <= threshold) totalAskLiquidity += q * p;
+    }
+    return {
+      totalBidLiquidity,
+      totalAskLiquidity,
+      spreadPercent,
+      marketDepth: totalBidLiquidity + totalAskLiquidity,
+      bidLevels: orderbook.bids.length,
+      askLevels: orderbook.asks.length,
+    };
+  }
+
+  private async getMarketFees(symbol: string): Promise<number> {
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    const rows = await this.getSymbolsRowsCached();
+    const row = rows.find((s) => String(s.name ?? '') === sodexSymbol);
+    if (row) {
+      const maker = parseFloat(String(row.makerFee ?? '0'));
+      const taker = parseFloat(String(row.takerFee ?? '0'));
+      if (Number.isFinite(taker) && taker > 0) return taker;
+      if (Number.isFinite(maker) && maker > 0) return maker;
+    }
+    throw new Error('SoDEX fee schedule unavailable for this market');
+  }
+
+  async estimateFeesIfAvailable(symbol: string): Promise<number> {
+    return this.getMarketFees(symbol);
+  }
+
+  private estimateSlippageFromBook(
+    orders: SodexOrderbookEntry[],
+    targetBaseQty: number
+  ): { slippage: number; walkSideEmpty: boolean } {
+    if (!orders.length) return { slippage: 0, walkSideEmpty: true };
+    let totalBaseFilled = 0;
+    let weightedPrice = 0;
+    let firstPrice = 0;
+    for (const order of orders) {
+      const price = parseFloat(order.price);
+      const quantity = parseFloat(order.quantity);
+      if (!Number.isFinite(price) || !Number.isFinite(quantity) || price <= 0) continue;
+      if (firstPrice === 0) firstPrice = price;
+      if (totalBaseFilled + quantity >= targetBaseQty) {
+        weightedPrice += price * (targetBaseQty - totalBaseFilled);
+        totalBaseFilled = targetBaseQty;
+        break;
+      }
+      weightedPrice += price * quantity;
+      totalBaseFilled += quantity;
+    }
+    if (firstPrice <= 0 || totalBaseFilled <= 0) return { slippage: 0, walkSideEmpty: true };
+    if (totalBaseFilled < targetBaseQty) {
+      throw new Error('Insufficient visible book depth to estimate slippage for this size');
+    }
+    const avgPrice = weightedPrice / totalBaseFilled;
+    return { slippage: Math.min(Math.abs(avgPrice - firstPrice) / firstPrice, 0.5), walkSideEmpty: false };
+  }
+
+  private async buildExecutionPreviewFromData(
+    tradeInput: { symbol: string; action: string; amount: number },
+    ticker: SodexTicker,
+    orderbook: SodexOrderbook,
+    bookTicker: SodexBookTicker,
+    liquidityAnalysis: Awaited<ReturnType<SoDEXAPI['analyzeLiquidityFromData']>>,
+    fees: number
+  ): Promise<SodexExecutionPreview> {
+    const { symbol, action, amount } = tradeInput;
+    const side = action.toUpperCase() as 'BUY' | 'SELL';
+    const currentPrice = parseFloat(ticker.lastPrice);
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+      throw new Error('SoDEX ticker price invalid for execution preview');
+    }
+    const { bidPrice, askPrice } = await this.resolveTopOfBookPrices(symbol, orderbook, bookTicker);
+    const mid = (bidPrice + askPrice) / 2;
+    const refPrice = mid > 0 ? mid : currentPrice;
+    const targetBaseQty = refPrice > 0 ? amount / refPrice : 0;
+    const orders = side === 'BUY' ? orderbook.asks : orderbook.bids;
+    const { slippage, walkSideEmpty } = targetBaseQty > 0
+      ? this.estimateSlippageFromBook(orders, targetBaseQty)
+      : { slippage: 0, walkSideEmpty: orders.length === 0 };
+
+    const priceImpact = slippage * 0.5;
+    const quoteVol24h = parseFloat(ticker.quoteVolume);
+    const volume24hBase = parseFloat(ticker.volume);
+    const liquidityRatio =
+      amount > 0 && Number.isFinite(liquidityAnalysis.marketDepth)
+        ? liquidityAnalysis.marketDepth / amount
+        : 0;
+    // Higher liquidityRatio = easier execution; cap at 0.95
+    const executionProbability = Math.min(0.95, Math.max(0, Math.log1p(liquidityRatio) / Math.log1p(20)));
+    const warnings: string[] = [];
+    if (walkSideEmpty) {
+      warnings.push(
+        `SoDEX has no visible ${side === 'BUY' ? 'ask' : 'bid'} liquidity in the snapshot; depth-based slippage is not applicable (treated as 0 for preview).`
+      );
+    }
+    if (slippage > 0.02) warnings.push('High slippage expected');
+    if (executionProbability < 0.5) warnings.push('Low execution probability');
+    if (Number.isFinite(quoteVol24h) && quoteVol24h > 0 && amount > quoteVol24h * 0.1) {
+      warnings.push('Large order relative to 24h quote volume');
+    } else if (Number.isFinite(volume24hBase) && volume24hBase > 0 && currentPrice > 0 && amount > volume24hBase * currentPrice * 0.1) {
+      warnings.push('Large order relative to 24h base volume');
+    }
+    if (liquidityAnalysis.spreadPercent > 0.5) warnings.push('Wide bid-ask spread');
+    if (liquidityAnalysis.marketDepth < amount * 2) warnings.push('Thin depth near mid price');
+    return {
+      symbol,
+      side,
+      amount,
+      estimatedPrice: currentPrice,
+      estimatedSlippage: slippage,
+      estimatedFees: fees,
+      priceImpact,
+      executionProbability,
+      warnings,
+      canExecute: false,
+      mode: 'preview',
+      liquidityAnalysis: {
+        totalBidLiquidity: liquidityAnalysis.totalBidLiquidity,
+        totalAskLiquidity: liquidityAnalysis.totalAskLiquidity,
+        spreadPercent: liquidityAnalysis.spreadPercent,
+        marketDepth: liquidityAnalysis.marketDepth,
+      },
+    };
+  }
+
+  async prepareExecutionPreview(tradeInput: {
+    symbol: string;
+    action: string;
+    amount: number;
+  }): Promise<SodexExecutionPreview> {
+    const { symbol } = tradeInput;
+    const exists = await this.validateSymbolExists(symbol);
+    if (!exists) throw new Error(`Symbol ${symbol} not found on SoDEX markets`);
+    const [ticker, orderbook, bookTicker, fees] = await Promise.all([
+      this.getSpotTicker(symbol),
+      this.getSpotOrderbook(symbol, 100),
+      this.getSpotBookTicker(symbol),
+      this.estimateFeesIfAvailable(symbol),
+    ]);
+    const liquidityAnalysis = await this.analyzeLiquidityFromData(symbol, orderbook, bookTicker);
+    return this.buildExecutionPreviewFromData(tradeInput, ticker, orderbook, bookTicker, liquidityAnalysis, fees);
+  }
+
+  /** One coordinated fetch — each endpoint called exactly once. */
+  async fetchMarketMicrostructure(
+    symbol: string,
+    tradeInput: { symbol: string; action: string; amount: number }
+  ): Promise<SodexMarketMicrostructure> {
+    const t0 = Date.now();
+    const sodexSymbol = this.mapSymbolToSodexFormat(symbol);
+    const basePath = `/markets/${encodeURIComponent(sodexSymbol)}`;
+    const endpoints = [
+      `${this.spotBaseUrl}/markets/tickers`,
+      `${this.spotBaseUrl}/markets/bookTickers`,
+      `${this.spotBaseUrl}${basePath}/orderbook`,
+      `${this.spotBaseUrl}${basePath}/klines`,
+      `${this.spotBaseUrl}${basePath}/trades`,
+    ];
+    const [ticker, bookTicker, orderbook, klines, recentTrades, fees] = await Promise.all([
+      this.getSpotTicker(symbol),
+      this.getSpotBookTicker(symbol),
+      this.getSpotOrderbook(symbol, 100),
+      this.getSpotKlines(symbol, '1h', 48),
+      this.getSpotTrades(symbol, 100),
+      this.estimateFeesIfAvailable(symbol),
+    ]);
+    const liquidityAnalysis = await this.analyzeLiquidityFromData(symbol, orderbook, bookTicker);
+    const executionPreview = await this.buildExecutionPreviewFromData(
+      tradeInput, ticker, orderbook, bookTicker, liquidityAnalysis, fees
+    );
+    return {
+      ticker,
+      orderbook,
+      klines,
+      recentTrades,
+      executionPreview,
+      liquidityAnalysis,
+      meta: { endpoints, network: this.network, fetchedAtMs: t0 },
+    };
+  }
+}
+
+export const sodexAPI = new SoDEXAPI();
