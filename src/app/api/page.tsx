@@ -254,7 +254,7 @@ export default function APIPage() {
             <Card className="terminal-card border-primary/20">
               <CardHeader>
                 <div className="flex items-center justify-between">
-                  <CardTitle className="text-card-heading">Place Signed Order (testnet)</CardTitle>
+                  <CardTitle className="text-card-heading">Place Signed Order (testnet by default)</CardTitle>
                   <Badge className="bg-primary text-background">POST</Badge>
                 </div>
               </CardHeader>
@@ -263,16 +263,15 @@ export default function APIPage() {
                   POST /api/sodex/place-order
                 </div>
                 <p>
-                  Submits a client-signed order to the SoDEX <span className="font-mono">testnet</span> spot API. Two
-                  constraints are enforced server-side and are not configurable: the deployment must be running with{' '}
-                  <span className="font-mono">SODEX_USE_TESTNET=true</span>, and the request is routed to the testnet
-                  gateway regardless of payload content. If either fails the route returns{' '}
-                  <span className="font-mono">403 MAINNET_DISABLED</span>. Mainnet execution is not implemented in this
-                  app.
+                  Submits a client-signed order to the selected SoDEX spot API. Testnet is the default. Mainnet is
+                  available only when both <span className="font-mono">SODEX_USE_TESTNET=false</span> and{' '}
+                  <span className="font-mono">SODEX_ENABLE_MAINNET_TRADING=true</span> are explicitly set; otherwise
+                  signing and submission return <span className="font-mono">403 MAINNET_DISABLED</span>. Each network
+                  uses its own chain ID, endpoint, and builder configuration.
                 </p>
                 <p>
-                  The signature is produced by the user&apos;s wallet in the browser; this route forwards the already-signed
-                  payload. It cannot move mainnet funds under any input.
+                  The order and any builder approval are signed by the user&apos;s wallet in the browser. Mainnet orders
+                  can use real funds and require a separate deployment-level opt-in.
                 </p>
               </CardContent>
             </Card>
@@ -325,7 +324,7 @@ export default function APIPage() {
                     <tr>
                       <td className="text-text-primary font-mono">403</td>
                       <td className="text-text-secondary font-mono text-xs">MAINNET_DISABLED</td>
-                      <td className="text-text-secondary">Order placement requested while not on testnet</td>
+                      <td className="text-text-secondary">Mainnet selected without both explicit execution opt-ins</td>
                     </tr>
                     <tr>
                       <td className="text-text-primary font-mono">404</td>

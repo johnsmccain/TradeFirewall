@@ -51,14 +51,19 @@ export function TradeInputForm({ onSubmit, isLoading = false }: TradeInputFormPr
   const [loadingCurrencies, setLoadingCurrencies] = useState(true);
   const comboRef = useRef<HTMLDivElement>(null);
 
-  // Fetch currency list once on mount
+  // Fetch live SoDEX markets once on mount; the picker must reflect the configured network.
   useEffect(() => {
-    fetch('/api/sosovalue/currencies')
+    fetch('/api/sodex/symbols')
       .then((r) => r.json())
       .then((d) => {
-        if (Array.isArray(d.currencies)) setCurrencies(d.currencies);
+        if (Array.isArray(d.symbols)) {
+          setCurrencies(d.symbols.map((item: { symbol: string; market: string }) => ({
+            symbol: item.symbol,
+            name: item.market,
+          })));
+        }
       })
-      .catch(() => {/* silently degrade to manual input */})
+      .catch(() => {/* manual entry still works; the analysis endpoint validates the market */})
       .finally(() => setLoadingCurrencies(false));
   }, []);
 
@@ -249,7 +254,7 @@ export function TradeInputForm({ onSubmit, isLoading = false }: TradeInputFormPr
                 )}
               </div>
               {currencies.length > 0 && (
-                <p className="text-xs text-text-secondary">{currencies.length} supported assets</p>
+                <p className="text-xs text-text-secondary">{currencies.length} active SoDEX markets on this network</p>
               )}
             </div>
 

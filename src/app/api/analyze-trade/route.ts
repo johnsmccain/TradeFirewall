@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { riskEngine, TradeInput } from '@/lib/riskEngine';
 import { riskExplanationGenerator } from '@/lib/riskExplanation';
+import { sodexAPI } from '@/lib/sodex';
 import { APIConnectionError, SoSoValueHttpError, SoSoValueTimeoutError } from '@/lib/sosovalue';
 import {
   isBuiltInProfile,
@@ -74,6 +75,25 @@ export async function POST(request: NextRequest) {
 
     // Normalize symbol to uppercase
     tradeInput.symbol = tradeInput.symbol.toUpperCase();
+
+    // SoSoValue coverage alone does not guarantee that this app can analyze or execute
+    // the asset on the configured SoDEX network. Reject unlisted markets explicitly.
+    let sodexSymbols: Awaited<ReturnType<typeof sodexAPI.getSupportedSpotSymbols>>;
+    try {
+      sodexSymbols = await sodexAPI.getSupportedSpotSymbols();
+    } catch (error) {
+      console.error('SoDEX market-list lookup failed:', error);
+      return NextResponse.json(
+        { error: 'Could not verify this symbol against SoDEX markets. Please try again.', errorType: 'SODEX_MARKETS_UNAVAILABLE' },
+        { status: 503 }
+      );
+    }
+    if (!sodexSymbols.some(({ symbol }) => symbol === tradeInput.symbol)) {
+      return NextResponse.json(
+        { error: `${tradeInput.symbol} is not currently available on SoDEX ${sodexAPI.configuredNetwork}.`, errorType: 'SYMBOL_NOT_AVAILABLE_ON_SODEX' },
+        { status: 404 }
+      );
+    }
 
     // Analyze trade risk using real API data
     const riskAnalysis = await riskEngine.analyzeTradeRisk(tradeInput);

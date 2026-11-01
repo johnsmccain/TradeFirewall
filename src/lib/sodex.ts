@@ -1,4 +1,4 @@
-// SoDEX public REST — https://testnet-gw.sodex.dev/api/v1/spot (default)
+// SoDEX public REST — Testnet by default, with separate Mainnet configuration
 // Responses use `code` + `data`; tickers/orderbooks use exchange-native field names.
 
 export interface SodexSymbol {
@@ -23,6 +23,16 @@ export interface SodexSymbol {
   quantityPrecision?: number;
   minNotional?: string;
 }
+
+const SODEX_SYMBOL_MAP: Record<string, string> = {
+  BTC: 'vBTC_vUSDC', ETH: 'vETH_vUSDC', SOL: 'vSOL_vUSDC', ADA: 'vADA_vUSDC',
+  AVAX: 'vAVAX_vUSDC', DOGE: 'vDOGE_vUSDC', XRP: 'vXRP_vUSDC', BNB: 'vBNB_vUSDC',
+  LINK: 'vLINK_vUSDC', UNI: 'vUNI_vUSDC', AAVE: 'vAAVE_vUSDC', LTC: 'vLTC_vUSDC',
+  SHIB: 'vSHIB_vUSDC', ZEC: 'vZEC_vUSDC', USDT: 'vUSDT_vUSDC', SOSO: 'WSOSO_vUSDC',
+  HYPE: 'vHYPE_vUSDC', AAPL: 'vAAPL_vUSDC', TSLA: 'vTSLA_vUSDC', NVDA: 'vNVDA_vUSDC',
+  MSFT: 'vMSFT_vUSDC', GOOGL: 'vGOOGL_vUSDC', AMZN: 'vAMZN_vUSDC', META: 'vMETA_vUSDC',
+  TESTBTC: 'TESTBTC_vUSDC', TESTSOSO: 'TESTSOSO_vUSDC', TESTSHIB: 'TESTSHIB_vUSDC',
+};
 
 export interface SodexAccountState {
   address: string;
@@ -204,8 +214,8 @@ class SoDEXAPI {
     return payload;
   }
 
-  /** Read-only mainnet base URL, independent of SODEX_USE_TESTNET — used only for historical
-   * backtest data (real prices), never for order placement (execution stays testnet-only). */
+  /** Read-only mainnet base URL, independent of SODEX_USE_TESTNET — used for historical
+   * backtest data; order placement uses the instance's explicitly selected network URL. */
   static readonly MAINNET_SPOT_URL = (
     process.env.SODEX_MAINNET_SPOT_URL || 'https://mainnet-gw.sodex.dev/api/v1/spot'
   ).replace(/\/$/, '');
@@ -234,37 +244,19 @@ class SoDEXAPI {
   }
 
   private mapSymbolToSodexFormat(symbol: string): string {
-    const symbolMap: Record<string, string> = {
-      BTC: 'vBTC_vUSDC',
-      ETH: 'vETH_vUSDC',
-      SOL: 'vSOL_vUSDC',
-      ADA: 'vADA_vUSDC',
-      AVAX: 'vAVAX_vUSDC',
-      DOGE: 'vDOGE_vUSDC',
-      XRP: 'vXRP_vUSDC',
-      BNB: 'vBNB_vUSDC',
-      LINK: 'vLINK_vUSDC',
-      UNI: 'vUNI_vUSDC',
-      AAVE: 'vAAVE_vUSDC',
-      LTC: 'vLTC_vUSDC',
-      SHIB: 'vSHIB_vUSDC',
-      ZEC: 'vZEC_vUSDC',
-      USDT: 'vUSDT_vUSDC',
-      SOSO: 'WSOSO_vUSDC',
-      HYPE: 'vHYPE_vUSDC',
-      AAPL: 'vAAPL_vUSDC',
-      TSLA: 'vTSLA_vUSDC',
-      NVDA: 'vNVDA_vUSDC',
-      MSFT: 'vMSFT_vUSDC',
-      GOOGL: 'vGOOGL_vUSDC',
-      AMZN: 'vAMZN_vUSDC',
-      META: 'vMETA_vUSDC',
-      TESTBTC: 'TESTBTC_vUSDC',
-      TESTSOSO: 'TESTSOSO_vUSDC',
-      TESTSHIB: 'TESTSHIB_vUSDC',
-    };
     const u = symbol.toUpperCase();
-    return symbolMap[u] || symbol;
+    return SODEX_SYMBOL_MAP[u] || symbol;
+  }
+
+  /** Symbols the app knows how to analyze and that are currently listed on this network. */
+  async getSupportedSpotSymbols(): Promise<Array<{ symbol: string; market: string }>> {
+    const rows = await this.getSymbolsRowsCached();
+    const activeNames = new Set(rows
+      .filter((row) => !row.status || String(row.status).toUpperCase() === 'TRADING')
+      .map((row) => String(row.name ?? row.symbol ?? '')));
+    return Object.entries(SODEX_SYMBOL_MAP)
+      .filter(([, market]) => activeNames.has(market))
+      .map(([symbol, market]) => ({ symbol, market }));
   }
 
   private normalizeTickerRow(raw: Record<string, unknown>, sodexSymbol: string): SodexTicker {
@@ -480,12 +472,12 @@ class SoDEXAPI {
 
   /**
    * Resolves a wallet address to its SoDEX accountID. Public, no auth required.
-   * Always reads from this instance's configured network (testnet by default —
-   * matches where order placement actually happens).
+   * Always reads from this instance's configured network (testnet by default).
    */
   async getAccountState(address: string): Promise<SodexAccountState> {
-    const NOT_ONBOARDED_MESSAGE =
-      'This wallet has no SoDEX testnet account yet. Visit https://testnet.sodex.com, connect this wallet, and claim testnet funds from the faucet, then try again.';
+    const NOT_ONBOARDED_MESSAGE = this.network === 'testnet'
+      ? 'This wallet has no SoDEX testnet account yet. Visit https://testnet.sodex.com, connect this wallet, and claim testnet funds from the faucet, then try again.'
+      : 'This wallet has no SoDEX mainnet account yet.';
 
     let raw: { user?: string; aid?: number; uid?: number; B?: Array<{ i: number; a: string; t: string; l: string }> };
     try {

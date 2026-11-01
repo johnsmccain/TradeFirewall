@@ -354,8 +354,8 @@ export default function PricingPage() {
                     </tr>
                     <tr>
                       <td className="text-text-primary font-medium">Signed order placement</td>
-                      <td className="text-center text-warning">Testnet only</td>
-                      <td className="text-text-secondary">SoDEX testnet. Mainnet execution is not implemented and is blocked server-side</td>
+                      <td className="text-center text-warning">Testnet default</td>
+                      <td className="text-text-secondary">Mainnet requires both SODEX_USE_TESTNET=false and SODEX_ENABLE_MAINNET_TRADING=true</td>
                     </tr>
                     <tr>
                       <td className="text-text-primary font-medium">Accounts &amp; billing</td>

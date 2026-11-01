@@ -9,9 +9,15 @@ import {
   formatDecimalString,
   snapToStep,
   buildBatchNewOrderParams,
+  hasSufficientBuilderFeeApproval,
+  isBuilderFeeApprovalRevoked,
   computePayloadHash,
   buildExchangeActionTypedData,
+  buildApproveBuilderFeeTypedData,
+  builderFeeRateToPercent,
+  estimateBuilderFeeUsd,
   toSodexApiSign,
+  toSodexBuilderApprovalApiSign,
   generateClOrdID,
   generateNonce,
 } from './sodexOrderSigning';
@@ -129,6 +135,13 @@ describe('buildBatchNewOrderParams', () => {
     expect(params.orders).toHaveLength(1);
   });
 
+  it('appends batch-level builder attribution after orders, with id before fee', () => {
+    const params = buildBatchNewOrderParams({ ...base, price: '100', quantity: '2', builder: { id: 8, fee: 50 } });
+    expect(Object.keys(params)).toEqual(['accountID', 'orders', 'builder']);
+    expect(Object.keys(params.builder!)).toEqual(['id', 'fee']);
+    expect(params.builder).toEqual({ id: 8, fee: 50 });
+  });
+
   it('keeps optional fields in position when only one is present', () => {
     const params = buildBatchNewOrderParams({ ...base, quantity: '2' });
     expect(Object.keys(params.orders[0])).toEqual([
@@ -184,12 +197,79 @@ describe('computePayloadHash', () => {
     expect(computePayloadHash(mk({ clOrdID: 'y' }))).not.toBe(base);
   });
 
+  it('includes builder attribution in the signed hash', () => {
+    const params = buildBatchNewOrderParams({
+      accountID: 1, symbolID: 2, clOrdID: 'x',
+      side: OrderSide.SELL, type: OrderType.LIMIT, timeInForce: TimeInForce.IOC,
+      price: '100', quantity: '2', builder: { id: 8, fee: 50 },
+    });
+    expect(JSON.stringify(params)).toBe(
+      '{"accountID":1,"orders":[{"symbolID":2,"clOrdID":"x","side":2,"type":1,"timeInForce":3,"price":"100","quantity":"2"}],"builder":{"id":8,"fee":50}}'
+    );
+    expect(computePayloadHash(params)).toBe(
+      keccak256(stringToHex(JSON.stringify({ type: 'batchNewOrder', params })))
+    );
+    expect(computePayloadHash({ accountID: params.accountID, orders: params.orders })).not.toBe(computePayloadHash(params));
+  });
+
   it('returns a 32-byte hex string', () => {
     const params = buildBatchNewOrderParams({
       accountID: 1, symbolID: 2, clOrdID: 'x',
       side: OrderSide.BUY, type: OrderType.LIMIT, timeInForce: TimeInForce.GTC,
     });
     expect(computePayloadHash(params)).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  describe('builder fee units', () => {
+    it('treats 50 as 0.05% and estimates the fee against notional', () => {
+      expect(builderFeeRateToPercent(50)).toBe(0.05);
+      expect(estimateBuilderFeeUsd(1000, 50)).toBe(0.5);
+    });
+  });
+
+  describe('hasSufficientBuilderFeeApproval', () => {
+    it('requires the builder fee approval on both Spot and Perps', () => {
+      const spot = [{ builderID: 8, feeRate: 50 }];
+      expect(hasSufficientBuilderFeeApproval({ spot, perps: spot }, 8, 50)).toBe(true);
+      expect(hasSufficientBuilderFeeApproval({ spot, perps: [] }, 8, 50)).toBe(false);
+      expect(hasSufficientBuilderFeeApproval({ spot, perps: undefined }, 8, 50)).toBe(false);
+      expect(hasSufficientBuilderFeeApproval({ spot: undefined, perps: spot }, 8, 50)).toBe(false);
+    });
+
+    describe('isBuilderFeeApprovalRevoked', () => {
+      it('requires both engine results to confirm there is no active approval', () => {
+        expect(isBuilderFeeApprovalRevoked({ spot: [], perps: [] }, 8)).toBe(true);
+        expect(isBuilderFeeApprovalRevoked({ spot: [], perps: undefined }, 8)).toBe(false);
+        expect(isBuilderFeeApprovalRevoked({ spot: undefined, perps: [] }, 8)).toBe(false);
+        expect(isBuilderFeeApprovalRevoked(
+          { spot: [], perps: [{ builderID: 8, feeRate: 1 }] },
+          8
+        )).toBe(false);
+        expect(isBuilderFeeApprovalRevoked(
+          { spot: [], perps: [{ builderID: 8 }] },
+          8
+        )).toBe(false);
+      });
+    });
+
+    it('treats revoked, malformed, or insufficient approvals as not approved', () => {
+      expect(hasSufficientBuilderFeeApproval({ spot: [], perps: [] }, 8, 50)).toBe(false);
+      expect(hasSufficientBuilderFeeApproval(
+        { spot: [{ builderID: 8, feeRate: 49 }], perps: [{ builderID: 8, feeRate: 50 }] },
+        8,
+        50
+      )).toBe(false);
+      expect(hasSufficientBuilderFeeApproval(
+        { spot: [{ builderID: 9, feeRate: 50 }], perps: [{ builderID: 8, feeRate: 50 }] },
+        8,
+        50
+      )).toBe(false);
+      expect(hasSufficientBuilderFeeApproval(
+        { spot: [{ builderID: 8, feeRate: 'not-a-rate' }], perps: [{ builderID: 8, feeRate: 50 }] },
+        8,
+        50
+      )).toBe(false);
+    });
   });
 
   it("has no whitespace, matching Go json.Marshal", () => {
@@ -214,6 +294,41 @@ describe('buildExchangeActionTypedData', () => {
     expect(td.domain.version).toBe('1');
     expect(td.domain.chainId).toBe(SODEX_TESTNET_CHAIN_ID);
     expect(td.domain.verifyingContract).toBe('0x0000000000000000000000000000000000000000');
+  });
+
+  describe('buildApproveBuilderFeeTypedData', () => {
+    const approval = {
+      accountID: 1010,
+      builderID: 1234,
+      maxFeeRate: 50,
+      nonce: 1760373925000,
+      chainId: SODEX_TESTNET_CHAIN_ID,
+    };
+
+    it('uses the universal domain and master-wallet approval action shape', () => {
+      const typedData = buildApproveBuilderFeeTypedData(approval);
+      expect(typedData.domain).toEqual({
+        name: 'universal',
+        version: '1',
+        chainId: SODEX_TESTNET_CHAIN_ID,
+        verifyingContract: '0x0000000000000000000000000000000000000000',
+      });
+      expect(typedData.primaryType).toBe('ApproveBuilderFeeAction');
+      expect(typedData.types.ApproveBuilderFeeAction).toEqual([
+        { name: 'chainID', type: 'uint64' },
+        { name: 'nonce', type: 'uint64' },
+        { name: 'accountID', type: 'uint64' },
+        { name: 'builderID', type: 'uint64' },
+        { name: 'maxFeeRate', type: 'uint64' },
+      ]);
+      expect(typedData.message).toEqual({
+        chainID: SODEX_TESTNET_CHAIN_ID,
+        nonce: approval.nonce,
+        accountID: approval.accountID,
+        builderID: approval.builderID,
+        maxFeeRate: approval.maxFeeRate,
+      });
+    });
   });
 
   it('declares ExchangeAction as the primary type with the right fields', () => {
@@ -242,6 +357,18 @@ describe('toSodexApiSign', () => {
     const sig = toSodexApiSign(`0x${rs}1b`); // 1b = 27
     expect(sig).toBe(`0x01${rs}00`);
     expect(sig).toHaveLength(2 + 2 + 128 + 2);
+  });
+
+  describe('toSodexBuilderApprovalApiSign', () => {
+    const rs = 'a'.repeat(128);
+
+    it('uses the universal-action 0x02 prefix and normalizes v', () => {
+      expect(toSodexBuilderApprovalApiSign(`0x${rs}1c`)).toBe(`0x02${rs}01`);
+    });
+
+    it('rejects invalid signatures', () => {
+      expect(() => toSodexBuilderApprovalApiSign(`0x${rs}05`)).toThrow(/recovery byte/);
+    });
   });
 
   it("converts v=28 to the 0x01 prefix with v'=0x01", () => {
@@ -305,12 +432,12 @@ describe('generateNonce', () => {
     const nonce = generateNonce();
     const after = Date.now();
     expect(nonce).toBeGreaterThanOrEqual(before);
-    expect(nonce).toBeLessThanOrEqual(after);
+    expect(nonce).toBeLessThanOrEqual(after + 1);
     // SoDEX rejects nonces more than 2 days old or over 1 day in the future.
     expect(nonce).toBeLessThan(after + 24 * 60 * 60 * 1000);
   });
 
-  it("is monotonically non-decreasing across calls", () => {
-    expect(generateNonce()).toBeLessThanOrEqual(generateNonce());
+  it('is strictly increasing across rapid approval and order actions', () => {
+    expect(generateNonce()).toBeLessThan(generateNonce());
   });
 });

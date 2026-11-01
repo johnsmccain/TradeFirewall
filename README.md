@@ -1009,12 +1009,24 @@ SOSOVALUE_API_KEY=
 # SoDEX public REST (no API key required for reads)
 SODEX_USE_TESTNET=true
 SODEX_TESTNET_SPOT_URL=https://testnet-gw.sodex.dev/api/v1/spot
-SODEX_TESTNET_PERPS_URL=https://testnet-gw.sodex.dev/api/v1/perps
+# SODEX_TESTNET_RPC_URL=https://testnet.valuechain.xyz
+# Testnet builder config (legacy SODEX_BUILDER_* names are also supported)
+SODEX_TESTNET_BUILDER_ID=
+SODEX_TESTNET_BUILDER_FEE_RATE=50
+SODEX_TESTNET_BUILDER_OWNER_ADDRESS=
+# Mainnet is separate and disabled unless both opt-ins are explicitly set:
+# SODEX_USE_TESTNET=false
+# SODEX_ENABLE_MAINNET_TRADING=true
 # SODEX_MAINNET_SPOT_URL=https://mainnet-gw.sodex.dev/api/v1/spot
-# SODEX_MAINNET_PERPS_URL=https://mainnet-gw.sodex.dev/api/v1/perps
+# SODEX_MAINNET_RPC_URL=https://mainnet.valuechain.xyz
+# SODEX_MAINNET_BUILDER_ID=
+# SODEX_MAINNET_BUILDER_FEE_RATE=50
+# SODEX_MAINNET_BUILDER_OWNER_ADDRESS=
 ```
 
-SoDEX signing keys are **not** used by TradeFirewall for market-data reads or for on-chain execution (execution stays preview-only).
+Builder attribution is optional and applies only to eligible spot sell orders. The user explicitly opts in, may request a lower fee rate than the configured maximum, and changing consent or rate invalidates the prepared order and requires a fresh review. TradeFirewall checks for a sufficient approval on **both Spot and Perps** before preparing and again before submitting; missing engine data, revoked approval, or an approval below the requested rate is never treated as approval. A missing/revoked approval triggers a separate wallet approval. The approval uses the trader's primary account ID and the network-specific builder account ID. Spot fee rates are integers in tenths of a basis point (`50` = `0.05%`), with a maximum configured rate of `2000` (`2%`). SoDEX requires an activated builder account with the required balances in both Spot and Perps. A wallet-signing revocation flow submits rate `0` and reports success only after both engine lists confirm removal.
+
+No signing key is stored by TradeFirewall. The user's injected wallet signs the SoDEX builder approval, revocation, and order. Testnet remains the default. Mainnet uses separate URLs, chain ID, RPC URL, and builder config, and order signing/submission is disabled unless both `SODEX_USE_TESTNET=false` and `SODEX_ENABLE_MAINNET_TRADING=true` are set.
 
 ---
 
@@ -1355,21 +1367,22 @@ Wave 3 responds directly to judge feedback: make the product read as a statistic
 
 ### 3. Testnet Execution Gate
 
-The flow is now: trade idea → risk analysis → execution preview → confirmation gate → connect wallet / sign → SoDEX testnet order → order result.
+The flow is now: trade idea → risk analysis → execution preview → confirmation gate → connect wallet / sign → SoDEX order on the selected network (Testnet by default) → order result.
 
 - **APPROVE / CAUTION** results render `SoDEXOrderPlacement`, which connects an injected browser wallet (no wallet UI appears before a risk result exists), shows a live execution preview, an order ticket (symbol, side, quantity, order type, protection price, network, risk score) for review, then asks the wallet to sign — nothing is submitted until the user explicitly signs.
 - **REDUCE_OR_WAIT / BLOCK** results keep the existing `ConfirmationGate`, now decision-aware: BLOCK has no execution override at all, not even behind checkboxes; REDUCE_OR_WAIT's only forward path is reducing size and re-running analysis.
 - Signing uses standard EIP-712 (`eth_signTypedData_v4` — any injected wallet supports this natively, no client-side crypto library needed). The exact signing scheme — domain, `ExchangeAction(bytes32 payloadHash, uint64 nonce)` type, `payloadHash = keccak256(compact_json({type, params}))`, header format — is ported directly from SoDEX's public Go SDK (`github.com/sodex-tech/sodex-go-sdk-public`) in `src/lib/sodexOrderSigning.ts`, which lives server-side only; the private key never leaves the browser, and the server never sees anything but a signature.
-- `src/app/api/sodex/place-order/route.ts` resolves `accountID`/`symbolID` from public SoDEX reads, builds a slippage-protected marketable-limit order (LIMIT + IOC, price = current ask/bid ± a configurable protection margin), and re-checks the BLOCK/REDUCE_OR_WAIT gating server-side as a backstop against a tampered client. It is hardcoded to SoDEX's testnet endpoint and explicitly refuses to run at all if `SODEX_USE_TESTNET` isn't `true` — mainnet is not reachable from this route under any input.
+- For eligible spot sell orders, the review shows the requested Builder Fee and its estimated dollar value. If approval is missing or revoked, the user's primary wallet signs the separate `universal`-domain `ApproveBuilderFeeAction` (wire prefix `0x02`) before the normal `spot`-domain order signature (wire prefix `0x01`). Batch-level `builder: { id, fee }` is included in the order parameters before hashing; the fee units are tenths of a basis point (`50` = `0.05%`). Spot buy orders omit builder attribution because SoDEX does not charge builder fees on the buy side.
+- `src/app/api/sodex/place-order/route.ts` resolves `accountID`/`symbolID` from public SoDEX reads, builds a slippage-protected marketable-limit order (LIMIT + IOC, price = current ask/bid ± a configurable protection margin), and re-checks risk gating server-side. Testnet remains the default. Mainnet uses its own endpoint, chain ID, RPC URL, and Builder ID and requires both `SODEX_USE_TESTNET=false` and `SODEX_ENABLE_MAINNET_TRADING=true`; otherwise the route refuses all signing/submission actions.
 
-**Known limitation:** this environment has no funded SoDEX testnet wallet, so the `prepare` phase (account/symbol resolution, order sizing, payload-hash construction, typed-data generation) has been verified live against SoDEX testnet, but the full sign → submit → fill round trip has not been exercised end-to-end with a real wallet. Errors from SoDEX are surfaced verbatim rather than swallowed either way.
+**Known limitation:** the full sign → submit → fill round trip has not been exercised end-to-end with a real wallet. No live Builder Fee approval, fee-on-fill, builder-balance credit, or revocation has been verified. This checkout also has no configured Builder ID/owner address, so those checks must wait for the public identifiers and an interactive funded testnet wallet. Errors from SoDEX are surfaced rather than reported as success when engine data is missing.
 
 ### 4. Known Limitations (Wave 3, summarized)
 
 - Real backtest data covers ~9 months (whatever SoDEX mainnet's kline history holds today), not multi-year or named historical events.
 - 5 of 10 risk factors can't be reconstructed historically; backtest scoring uses the live engine's own neutral-default behavior for those.
 - Short-horizon price-direction prediction from volatility/trend alone is inherently weak in efficient markets — this shows up in the real backtest numbers and is called out on `/validate` rather than hidden.
-- The wallet-signed execution round trip is implemented against SoDEX's documented signing spec but not yet confirmed with a live funded testnet wallet.
+- The wallet-signed order and Builder Fee approval/revocation round trips are implemented against SoDEX's documented signing spec but not yet confirmed with a live funded testnet wallet.
 
 ---
 
@@ -1479,7 +1492,7 @@ All items verified for Wave 2 submission:
 - [x] Testnet execution gate — wallet connect, EIP-712 signed order, real SoDEX testnet submission
 - [x] BLOCK has no execution override; REDUCE_OR_WAIT requires resize + re-analysis (enforced client-side and server-side)
 - [x] `npm run typecheck` script added, matches this README's documented command
-- [ ] Full sign → submit → fill round trip confirmed with a live funded testnet wallet (prepare phase verified live; full round trip not yet wallet-tested)
+- [ ] Full sign → submit → fill and Builder Fee approval, fee credit, balance, and revocation confirmed with a live funded testnet wallet
 
 ---
 
